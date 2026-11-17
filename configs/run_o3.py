@@ -57,11 +57,8 @@ def parse_args():
     # baseline clock is not decided yet, so it is always passed explicitly
     p.add_argument("--clock", required=True, help="core clock, e.g. 3GHz")
     p.add_argument("--binary", required=True, help="static se-mode binary")
-    p.add_argument("--max-insts", type=int, default=0,
-                   help="stop after this many committed insts (0 = run "
-                        "to completion)")
-    p.add_argument("--disable-rvv", action="store_true",
-                   help="turn off the riscv vector extension")
+    p.add_argument("--max-insts", type=int, default=0, help="stop after this many committed insts (0 = run to completion)")
+    p.add_argument("--disable-rvv", action="store_true", help="turn off the riscv vector extension")
 
     g = p.add_argument_group("resizer (only used with --rob dynamic)")
     g.add_argument("--window-insts", type=int)
@@ -80,8 +77,7 @@ def parse_args():
 
     if args.rob == "dynamic":
         missing = [
-            name for name in ("window_insts", "shrink_rate", "grow_rate",
-                              "shrink_windows", "grow_windows")
+            name for name in ("window_insts", "shrink_rate", "grow_rate", "shrink_windows", "grow_windows")
             if getattr(args, name) is None
         ]
         if missing:

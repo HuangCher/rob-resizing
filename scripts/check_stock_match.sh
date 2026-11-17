@@ -31,6 +31,12 @@ run () {   # $1 = gem5 binary, $2 = outdir
 run "$stock" "$work/stock"
 run "$modified" "$work/modified"
 
+for d in stock modified; do
+    if [ ! -s "$work/$d/stats.txt" ]; then
+        echo "FAILED: no stats from $d run"; tail -20 "$work/$d.log"; exit 1
+    fi
+done
+
 # drop host-dependent lines before comparing
 filter () { grep -v -E '^[^ ]*host[A-Z]' "$1"; }
 filter "$work/stock/stats.txt" > "$work/a"

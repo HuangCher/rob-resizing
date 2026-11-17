@@ -25,10 +25,7 @@ LQ_RATIO = 1 / 8
 SQ_RATIO = 1 / 8
 
 # predictor key -> label used in result paths
-PREDICTORS = {
-    "tage": "high accuracy (tage)",
-    "local": "low accuracy (2-bit local)",
-}
+PREDICTORS = {"tage": "high accuracy (tage)", "local": "low accuracy (2-bit local)"}
 
 
 def window_sizes(config: str) -> dict:

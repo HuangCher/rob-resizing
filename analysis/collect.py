@@ -9,7 +9,7 @@ stats used (matched by suffix, so the board/core prefix does not matter):
     ipc             : commitStats0.ipc
     rob squashed    : commit.commitSquashedInsts
                       (squashed insts that reached the rob, skipped by commit)
-    issued squashed : iew.instQueue.squashedInstsIssued
+    issued squashed : squashedInstsIssued (iq stat, sits on the core)
                       (squashed insts that were already issued to execute)
     mispredicts     : commit.branchMispredicts
     committed ctrl  : commitStats0.committedControl::IsControl
@@ -43,7 +43,6 @@ STATS = {
 
 
 def read_stats(path: Path) -> dict:
-    """parse the first stats dump into {full stat name: float}."""
     stats = {}
     seen_begin = False
     with open(path) as f:
@@ -66,9 +65,7 @@ def read_stats(path: Path) -> dict:
 
 
 def pick(stats: dict, suffix: str):
-    """return the value of the single stat ending in suffix, or None."""
-    hits = [v for k, v in stats.items()
-            if k == suffix or k.endswith("." + suffix)]
+    hits = [v for k, v in stats.items() if k == suffix or k.endswith("." + suffix)]
     if len(hits) > 1:
         raise ValueError(f"stat suffix '{suffix}' is ambiguous")
     return hits[0] if hits else None
@@ -81,11 +78,6 @@ def per_kilo(count, insts):
 
 
 def power_proxy(row: dict):
-    """wasted dynamic power estimate from execution time and squash volume.
-
-    todo: the formula is an open decision (see claude.md, metric 3).
-    returns None until it is chosen.
-    """
     return None
 
 

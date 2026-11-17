@@ -1,0 +1,820 @@
+# base: f5c5a6e390f55dd5984977815bf9d0bd05da6945 (v25.1.0.1-13-gf5c5a6e390)
+diff --git a/src/cpu/o3/BaseO3CPU.py b/src/cpu/o3/BaseO3CPU.py
+index 3c477c115b..4f21cf2417 100644
+--- a/src/cpu/o3/BaseO3CPU.py
++++ b/src/cpu/o3/BaseO3CPU.py
+@@ -186,6 +186,10 @@ class BaseO3CPU(BaseCPU):
+     numPhysCCRegs = Param.Unsigned(0, "Number of physical cc registers")
+     instQueues = VectorParam.IQUnit(IQUnit(), "Vector of IQs")
+     numROBEntries = Param.Unsigned(192, "Number of reorder buffer entries")
++    # none keeps the stock static rob
++    robResizer = Param.RobResizer(
++        NULL, "Optional dynamic rob resizer driven by branch accuracy"
++    )
+ 
+     smtNumFetchingThreads = Param.Unsigned(1, "SMT Number of Fetching Threads")
+     smtFetchPolicy = Param.SMTFetchPolicy("RoundRobin", "SMT Fetch policy")
+diff --git a/src/cpu/o3/SConscript b/src/cpu/o3/SConscript
+old mode 100755
+new mode 100644
+index 53a022b7ce..d323ffbfc0
+--- a/src/cpu/o3/SConscript
++++ b/src/cpu/o3/SConscript
+@@ -47,6 +47,7 @@ if env['CONF']['BUILD_ISA']:
+     SimObject('FuncUnitConfig.py', sim_objects=[])
+     SimObject('BaseO3CPU.py', sim_objects=['BaseO3CPU'])
+     SimObject('IQUnit.py', sim_objects=['IQUnit'])
++    SimObject('RobResizer.py', sim_objects=['RobResizer'])
+     SimObject('SMT.py',
+         enums=['SMTFetchPolicy', 'SMTQueuePolicy', 'CommitPolicy'])
+ 
+@@ -68,6 +69,7 @@ if env['CONF']['BUILD_ISA']:
+     Source('rename.cc')
+     Source('rename_map.cc')
+     Source('rob.cc')
++    Source('rob_resizer.cc')
+     Source('scoreboard.cc')
+     Source('store_set.cc')
+     Source('thread_context.cc')
+@@ -84,6 +86,7 @@ if env['CONF']['BUILD_ISA']:
+     DebugFlag('O3CPU')
+     DebugFlag('ROB')
+     DebugFlag('Rename')
++    DebugFlag('RobResizer')
+     DebugFlag('Scoreboard')
+     DebugFlag('StoreSet')
+     DebugFlag('Writeback')
+diff --git a/src/cpu/o3/commit.cc b/src/cpu/o3/commit.cc
+index 405ea09d64..22e64a988a 100644
+--- a/src/cpu/o3/commit.cc
++++ b/src/cpu/o3/commit.cc
+@@ -54,6 +54,7 @@
+ #include "cpu/o3/cpu.hh"
+ #include "cpu/o3/dyn_inst.hh"
+ #include "cpu/o3/limits.hh"
++#include "cpu/o3/rob_resizer.hh"
+ #include "cpu/o3/thread_state.hh"
+ #include "cpu/timebuf.hh"
+ #include "debug/Activity.hh"
+@@ -464,6 +465,14 @@ Commit::numROBFreeEntries(ThreadID tid)
+     return rob->numFreeEntries(tid);
+ }
+ 
++void
++Commit::markROBLimitChanged()
++{
++    for (ThreadID tid = 0; tid < numThreads; tid++) {
++        changedROBNumEntries[tid] = true;
++    }
++}
++
+ void
+ Commit::generateTrapEvent(ThreadID tid, Fault inst_fault)
+ {
+@@ -839,6 +848,8 @@ Commit::commit()
+                      toIEW->commitInfo[tid].branchTaken = true;
+                 }
+                 ++stats.branchMispredicts;
++                if (cpu->robResizer)
++                    cpu->robResizer->notifyMispredict();
+             }
+ 
+             set(toIEW->commitInfo[tid].pc, fromIEW->pc[tid]);
+@@ -1376,6 +1387,11 @@ Commit::updateComInstStats(const DynInstPtr &inst)
+     //
+     cpu->commitStats[tid]->updateComCtrlStats(inst->staticInst);
+ 
++    // feed the rob resizer one event per committed macro instruction
++    if (cpu->robResizer && (!inst->isMicroop() || inst->isLastMicroop())) {
++        cpu->robResizer->notifyCommit(inst->isControl());
++    }
++
+     //
+     //  Memory references
+     //
+diff --git a/src/cpu/o3/commit.hh b/src/cpu/o3/commit.hh
+index 5f978c8c5d..98e3530c9b 100644
+--- a/src/cpu/o3/commit.hh
++++ b/src/cpu/o3/commit.hh
+@@ -214,6 +214,10 @@ class Commit
+     /** Returns the number of free ROB entries for a specific thread. */
+     size_t numROBFreeEntries(ThreadID tid);
+ 
++    /** forces the free rob count to be resent to rename next tick, used
++     *  when the rob resizer changes the active limit. */
++    void markROBLimitChanged();
++
+     /** Generates an event to schedule a squash due to a trap. */
+     void generateTrapEvent(ThreadID tid, Fault inst_fault);
+ 
+diff --git a/src/cpu/o3/cpu.cc b/src/cpu/o3/cpu.cc
+index ad539e7948..b35a4ac96c 100644
+--- a/src/cpu/o3/cpu.cc
++++ b/src/cpu/o3/cpu.cc
+@@ -43,11 +43,14 @@
+ 
+ #include "cpu/o3/cpu.hh"
+ 
++#include <algorithm>
++
+ #include "cpu/activity.hh"
+ #include "cpu/checker/cpu.hh"
+ #include "cpu/checker/thread_context.hh"
+ #include "cpu/o3/dyn_inst.hh"
+ #include "cpu/o3/limits.hh"
++#include "cpu/o3/rob_resizer.hh"
+ #include "cpu/o3/thread_context.hh"
+ #include "cpu/simple_thread.hh"
+ #include "cpu/thread_context.hh"
+@@ -97,6 +100,8 @@ CPU::CPU(const BaseO3CPUParams &params)
+ 
+       rob(this, params),
+ 
++      robResizer(params.robResizer),
++
+       scoreboard(name() + ".scoreboard", regFile.totalNumPhysRegs()),
+ 
+       isa(numThreads, NULL),
+@@ -180,6 +185,9 @@ CPU::CPU(const BaseO3CPUParams &params)
+     rename.setIEWStage(&iew);
+     rename.setCommitStage(&commit);
+ 
++    if (robResizer)
++        robResizer->setCPU(this);
++
+     ThreadID active_threads;
+     if (FullSystem) {
+         active_threads = 1;
+@@ -322,6 +330,22 @@ CPU::CPU(const BaseO3CPUParams &params)
+     }
+ }
+ 
++void
++CPU::setWindowLimit(unsigned rob_limit)
++{
++    const unsigned rob_size = rob.getNumEntries();
++    rob_limit = std::min(std::max(rob_limit, 1u), rob_size);
++
++    // iq and lsq keep the same fraction of their size as the rob
++    rob.setActiveLimit(rob_limit);
++    iew.instQueue.setActiveFraction(rob_limit, rob_size);
++    iew.ldstQueue.setActiveFraction(rob_limit, rob_size);
++
++    // make sure rename sees the new free counts even if the pipe is idle
++    commit.markROBLimitChanged();
++    iew.updateLSQNextCycle = true;
++}
++
+ void
+ CPU::regProbePoints()
+ {
+diff --git a/src/cpu/o3/cpu.hh b/src/cpu/o3/cpu.hh
+index faa31d6c1c..e292ca12b7 100644
+--- a/src/cpu/o3/cpu.hh
++++ b/src/cpu/o3/cpu.hh
+@@ -87,6 +87,7 @@ namespace o3
+ {
+ 
+ class ThreadContext;
++class RobResizer;
+ 
+ /**
+  * O3CPU class, has each of the stages (fetch through commit)
+@@ -447,6 +448,19 @@ class CPU : public BaseCPU
+     /** The re-order buffer. */
+     ROB rob;
+ 
++  public:
++    /** optional dynamic rob resizer. nullptr keeps the static rob. */
++    RobResizer *robResizer;
++
++    /** caps the rob to rob_limit entries and scales the iq and lsq
++     *  active limits by the same fraction of their physical size. */
++    void setWindowLimit(unsigned rob_limit);
++
++    /** physical rob size. */
++    unsigned numROBEntries() const { return rob.getNumEntries(); }
++
++  protected:
++
+     /** Active Threads List */
+     std::list<ThreadID> activeThreads;
+ 
+diff --git a/src/cpu/o3/inst_queue.cc b/src/cpu/o3/inst_queue.cc
+index dd26eca82f..223cf82e52 100644
+--- a/src/cpu/o3/inst_queue.cc
++++ b/src/cpu/o3/inst_queue.cc
+@@ -71,6 +71,7 @@ IQUnit::IQUnit(const IQUnitParams &params)
+       activeThreads(nullptr),
+       _freeEntries(params.numEntries),
+       _numEntries(params.numEntries),
++      activeLimit(params.numEntries),
+       _fuPool(params.fuPool)
+ {
+     assert(_fuPool);
+@@ -606,6 +607,17 @@ InstructionQueue::numFreeEntries(const DynInstPtr &inst)
+     return free_entries;
+ }
+ 
++void
++InstructionQueue::setActiveFraction(unsigned num, unsigned den)
++{
++    assert(den > 0);
++    for (auto iq : iqs) {
++        // round up so a small fraction never shuts a unit off completely
++        unsigned limit = (iq->numEntries() * num + den - 1) / den;
++        iq->setActiveLimit(limit);
++    }
++}
++
+ // Might want to do something more complex if it knows how many instructions
+ // will be issued this cycle.
+ bool
+diff --git a/src/cpu/o3/inst_queue.hh b/src/cpu/o3/inst_queue.hh
+index 844521caf9..9639269323 100644
+--- a/src/cpu/o3/inst_queue.hh
++++ b/src/cpu/o3/inst_queue.hh
+@@ -42,6 +42,7 @@
+ #ifndef __CPU_O3_INST_QUEUE_HH__
+ #define __CPU_O3_INST_QUEUE_HH__
+ 
++#include <algorithm>
+ #include <list>
+ #include <map>
+ #include <queue>
+@@ -96,15 +97,30 @@ class IQUnit : public SimObject
+     unsigned
+     numFreeEntries() const
+     {
+-        return _freeEntries;
++        // entries past the active limit are hidden from dispatch
++        unsigned used = _numEntries - _freeEntries;
++        return used >= activeLimit ? 0 : activeLimit - used;
+     }
+ 
+     unsigned
+     numFreeEntries(ThreadID tid) const
+     {
+-        return maxEntries[tid] - count[tid];
++        if (activeLimit >= _numEntries)
++            return maxEntries[tid] - count[tid];
++        unsigned lim = std::min(maxEntries[tid], activeLimit);
++        return count[tid] >= lim ? 0 : lim - count[tid];
+     }
+ 
++    /** caps how many entries can be allocated, without resizing storage.
++     *  entries already above the cap stay until they leave normally. */
++    void
++    setActiveLimit(unsigned limit)
++    {
++        activeLimit = std::min(std::max(limit, 1u), _numEntries);
++    }
++
++    unsigned getActiveLimit() const { return activeLimit; }
++
+     unsigned numFreeEntries(const DynInstPtr &inst) const;
+ 
+     /** Returns the number of used entries for a thread. */
+@@ -148,6 +164,9 @@ class IQUnit : public SimObject
+     /** The number of entries in the instruction queue. */
+     unsigned _numEntries;
+ 
++    /** usable entries, set by the rob resizer (defaults to _numEntries). */
++    unsigned activeLimit;
++
+     /** Max IQ Entries Per Thread */
+     unsigned maxEntries[MaxThreads];
+ 
+@@ -252,6 +271,9 @@ class InstructionQueue
+     /** Returns number of free entries for a thread. */
+     unsigned numFreeEntries(const DynInstPtr &inst);
+ 
++    /** scales every iq unit's active limit to num/den of its size. */
++    void setActiveFraction(unsigned num, unsigned den);
++
+     /** Returns whether or not the IQ is full. */
+     bool isFull();
+ 
+diff --git a/src/cpu/o3/lsq.cc b/src/cpu/o3/lsq.cc
+index da04dc5931..2f68cbc9d7 100644
+--- a/src/cpu/o3/lsq.cc
++++ b/src/cpu/o3/lsq.cc
+@@ -584,6 +584,18 @@ LSQ::numFreeStoreEntries(ThreadID tid)
+         return thread[tid].numFreeStoreEntries();
+ }
+ 
++void
++LSQ::setActiveFraction(unsigned num, unsigned den)
++{
++    assert(den > 0);
++    // round up so a small fraction never shuts the queues off completely
++    unsigned lq_limit = (maxLQEntries * num + den - 1) / den;
++    unsigned sq_limit = (maxSQEntries * num + den - 1) / den;
++    for (ThreadID tid = 0; tid < numThreads; tid++) {
++        thread[tid].setActiveLimits(lq_limit, sq_limit);
++    }
++}
++
+ bool
+ LSQ::isFull()
+ {
+diff --git a/src/cpu/o3/lsq.hh b/src/cpu/o3/lsq.hh
+index c208a9fd37..f4e642bf2c 100644
+--- a/src/cpu/o3/lsq.hh
++++ b/src/cpu/o3/lsq.hh
+@@ -809,6 +809,9 @@ class LSQ
+     /** Returns the number of free entries in the SQ for a specific thread. */
+     unsigned numFreeStoreEntries(ThreadID tid);
+ 
++    /** scales every thread's lq/sq active limit to num/den of its size. */
++    void setActiveFraction(unsigned num, unsigned den);
++
+     /** Returns if the LSQ is full (either LQ or SQ is full). */
+     bool isFull();
+     /**
+diff --git a/src/cpu/o3/lsq_unit.cc b/src/cpu/o3/lsq_unit.cc
+index 67ae69237e..9c985064bf 100644
+--- a/src/cpu/o3/lsq_unit.cc
++++ b/src/cpu/o3/lsq_unit.cc
+@@ -190,6 +190,7 @@ LSQUnit::completeDataAccess(PacketPtr pkt)
+ 
+ LSQUnit::LSQUnit(uint32_t lqEntries, uint32_t sqEntries)
+     : lsqID(-1), storeQueue(sqEntries), loadQueue(lqEntries),
++      lqActiveLimit(lqEntries), sqActiveLimit(sqEntries),
+       storesToWB(0),
+       htmStarts(0), htmStops(0),
+       lastRetiredHtmUid(0),
+@@ -427,7 +428,8 @@ LSQUnit::numFreeLoadEntries()
+ {
+         DPRINTF(LSQUnit, "LQ size: %d, #loads occupied: %d\n",
+                 loadQueue.capacity(), loadQueue.size());
+-        return loadQueue.capacity() - loadQueue.size();
++        return loadQueue.size() >= lqActiveLimit ?
++            0 : lqActiveLimit - loadQueue.size();
+ }
+ 
+ unsigned
+@@ -435,10 +437,20 @@ LSQUnit::numFreeStoreEntries()
+ {
+         DPRINTF(LSQUnit, "SQ size: %d, #stores occupied: %d\n",
+                 storeQueue.capacity(), storeQueue.size());
+-        return storeQueue.capacity() - storeQueue.size();
++        return storeQueue.size() >= sqActiveLimit ?
++            0 : sqActiveLimit - storeQueue.size();
+ 
+  }
+ 
++void
++LSQUnit::setActiveLimits(unsigned lq_limit, unsigned sq_limit)
++{
++    lqActiveLimit = std::min<unsigned>(std::max(lq_limit, 1u),
++                                       loadQueue.capacity());
++    sqActiveLimit = std::min<unsigned>(std::max(sq_limit, 1u),
++                                       storeQueue.capacity());
++}
++
+ void
+ LSQUnit::checkSnoop(PacketPtr pkt)
+ {
+diff --git a/src/cpu/o3/lsq_unit.hh b/src/cpu/o3/lsq_unit.hh
+index 40003ce0bb..2c3cbf4cf1 100644
+--- a/src/cpu/o3/lsq_unit.hh
++++ b/src/cpu/o3/lsq_unit.hh
+@@ -302,6 +302,10 @@ class LSQUnit
+     /** Returns the number of free SQ entries. */
+     unsigned numFreeStoreEntries();
+ 
++    /** caps how many lq/sq entries can be allocated, without resizing
++     *  storage. entries above the cap drain out normally. */
++    void setActiveLimits(unsigned lq_limit, unsigned sq_limit);
++
+     /** Returns the number of loads in the LQ. */
+     int numLoads() { return loadQueue.size(); }
+ 
+@@ -341,10 +345,10 @@ class LSQUnit
+     bool isEmpty() const { return lqEmpty() && sqEmpty(); }
+ 
+     /** Returns if the LQ is full. */
+-    bool lqFull() { return loadQueue.full(); }
++    bool lqFull() { return loadQueue.size() >= lqActiveLimit; }
+ 
+     /** Returns if the SQ is full. */
+-    bool sqFull() { return storeQueue.full(); }
++    bool sqFull() { return storeQueue.size() >= sqActiveLimit; }
+ 
+     /** Returns if the LQ is empty. */
+     bool lqEmpty() const { return loadQueue.size() == 0; }
+@@ -466,6 +470,10 @@ class LSQUnit
+     LoadQueue loadQueue;
+ 
+   private:
++    /** usable lq/sq entries, set by the rob resizer (default: capacity). */
++    unsigned lqActiveLimit;
++    unsigned sqActiveLimit;
++
+     /** The number of places to shift addresses in the LSQ before checking
+      * for dependency violations
+      */
+diff --git a/src/cpu/o3/rob.cc b/src/cpu/o3/rob.cc
+index 57a28ccbb4..410e747747 100644
+--- a/src/cpu/o3/rob.cc
++++ b/src/cpu/o3/rob.cc
+@@ -40,6 +40,7 @@
+ 
+ #include "cpu/o3/rob.hh"
+ 
++#include <algorithm>
+ #include <list>
+ 
+ #include "base/logging.hh"
+@@ -59,6 +60,7 @@ ROB::ROB(CPU *_cpu, const BaseO3CPUParams &params)
+     : robPolicy(params.smtROBPolicy),
+       cpu(_cpu),
+       numEntries(params.numROBEntries),
++      activeLimit(params.numROBEntries),
+       squashWidth(params.squashWidth),
+       numInstsInROB(0),
+       numThreads(params.numThreads),
+@@ -287,13 +289,25 @@ ROB::canCommit()
+ unsigned
+ ROB::numFreeEntries()
+ {
+-    return numEntries - numInstsInROB;
++    return numInstsInROB >= activeLimit ? 0 : activeLimit - numInstsInROB;
+ }
+ 
+ unsigned
+ ROB::numFreeEntries(ThreadID tid)
+ {
+-    return maxEntries[tid] - threadEntries[tid];
++    // keep the stock path untouched when no cap is applied
++    if (activeLimit >= numEntries)
++        return maxEntries[tid] - threadEntries[tid];
++    unsigned lim = std::min(maxEntries[tid], activeLimit);
++    return threadEntries[tid] >= lim ? 0 : lim - threadEntries[tid];
++}
++
++void
++ROB::setActiveLimit(unsigned limit)
++{
++    activeLimit = std::min(std::max(limit, 1u), numEntries);
++    DPRINTF(ROB, "Active ROB limit set to %u of %u entries\n",
++            activeLimit, numEntries);
+ }
+ 
+ void
+diff --git a/src/cpu/o3/rob.hh b/src/cpu/o3/rob.hh
+index a5e37793bf..85a8858bf4 100644
+--- a/src/cpu/o3/rob.hh
++++ b/src/cpu/o3/rob.hh
+@@ -174,6 +174,16 @@ class ROB
+     /** Returns the number of free entries in a specific ROB paritition. */
+     unsigned numFreeEntries(ThreadID tid);
+ 
++    /** caps how many entries can be allocated, without resizing storage.
++     *  instructions already above the cap drain out through commit. */
++    void setActiveLimit(unsigned limit);
++
++    /** returns the current allocation cap. */
++    unsigned getActiveLimit() const { return activeLimit; }
++
++    /** returns the physical number of entries. */
++    unsigned getNumEntries() const { return numEntries; }
++
+     /** Returns the maximum number of entries for a specific thread. */
+     unsigned getMaxEntries(ThreadID tid)
+     { return maxEntries[tid]; }
+@@ -279,6 +289,9 @@ class ROB
+     /** Number of instructions in the ROB. */
+     unsigned numEntries;
+ 
++    /** usable entries, set by the rob resizer (defaults to numEntries). */
++    unsigned activeLimit;
++
+     /** Entries Per Thread */
+     unsigned threadEntries[MaxThreads];
+ 
+diff --git a/src/cpu/o3/RobResizer.py b/src/cpu/o3/RobResizer.py
+new file mode 100644
+index 0000000000..0995139001
+--- /dev/null
++++ b/src/cpu/o3/RobResizer.py
+@@ -0,0 +1,46 @@
++# dynamic rob resizing driven by committed branch mispredict rate.
++#
++# the fsm has two states: full (physical numROBEntries) and restricted
++# (restrictedROBEntries). iq and lsq are capped by the same fraction.
++#
++# design parameters that are still open (thresholds, window size,
++# hysteresis) have no default on purpose, so every experiment script
++# has to choose them explicitly.
++
++from m5.params import *
++from m5.SimObject import SimObject
++
++
++class RobResizer(SimObject):
++    type = "RobResizer"
++    cxx_class = "gem5::o3::RobResizer"
++    cxx_header = "cpu/o3/rob_resizer.hh"
++
++    restrictedROBEntries = Param.Unsigned(
++        64, "Active rob entries while in the restricted state"
++    )
++
++    windowInsts = Param.UInt64(
++        "Sampling window length, in committed instructions"
++    )
++    minWindowBranches = Param.Unsigned(
++        1,
++        "Windows with fewer committed branches than this do not vote "
++        "for a state change",
++    )
++
++    shrinkMispredictRate = Param.Float(
++        "Mispredicts per committed branch above which a window votes "
++        "to shrink"
++    )
++    growMispredictRate = Param.Float(
++        "Mispredicts per committed branch below which a window votes "
++        "to grow (must be <= shrinkMispredictRate)"
++    )
++
++    shrinkWindows = Param.Unsigned(
++        "Consecutive shrink votes needed to enter the restricted state"
++    )
++    growWindows = Param.Unsigned(
++        "Consecutive grow votes needed to return to the full state"
++    )
+diff --git a/src/cpu/o3/rob_resizer.cc b/src/cpu/o3/rob_resizer.cc
+new file mode 100644
+index 0000000000..53ac0d1fdb
+--- /dev/null
++++ b/src/cpu/o3/rob_resizer.cc
+@@ -0,0 +1,162 @@
++#include "cpu/o3/rob_resizer.hh"
++
++#include "base/logging.hh"
++#include "base/trace.hh"
++#include "cpu/o3/cpu.hh"
++#include "debug/RobResizer.hh"
++
++namespace gem5
++{
++
++namespace o3
++{
++
++RobResizer::RobResizer(const RobResizerParams &params)
++    : SimObject(params),
++      cpu(nullptr),
++      _state(Full),
++      fullEntries(0),
++      restrictedEntries(params.restrictedROBEntries),
++      windowInsts(params.windowInsts),
++      minWindowBranches(params.minWindowBranches),
++      shrinkRate(params.shrinkMispredictRate),
++      growRate(params.growMispredictRate),
++      shrinkWindows(params.shrinkWindows),
++      growWindows(params.growWindows),
++      winInsts(0),
++      winBranches(0),
++      winMispredicts(0),
++      voteStreak(0),
++      stats(this)
++{
++    fatal_if(windowInsts == 0, "%s: windowInsts must be > 0", name());
++    fatal_if(restrictedEntries == 0,
++             "%s: restrictedROBEntries must be > 0", name());
++    fatal_if(shrinkRate < 0.0 || shrinkRate > 1.0 ||
++             growRate < 0.0 || growRate > 1.0,
++             "%s: mispredict rates must be in [0, 1]", name());
++    // grow threshold at or below shrink threshold gives the hysteresis band
++    fatal_if(growRate > shrinkRate,
++             "%s: growMispredictRate (%f) must be <= shrinkMispredictRate "
++             "(%f)", name(), growRate, shrinkRate);
++    fatal_if(shrinkWindows == 0 || growWindows == 0,
++             "%s: shrinkWindows and growWindows must be > 0", name());
++}
++
++void
++RobResizer::setCPU(CPU *_cpu)
++{
++    cpu = _cpu;
++    fullEntries = cpu->numROBEntries();
++    fatal_if(restrictedEntries > fullEntries,
++             "%s: restrictedROBEntries (%u) exceeds numROBEntries (%u)",
++             name(), restrictedEntries, fullEntries);
++}
++
++void
++RobResizer::notifyCommit(bool is_control)
++{
++    ++winInsts;
++    if (is_control) {
++        ++winBranches;
++        ++stats.branches;
++    }
++
++    if (_state == Full)
++        ++stats.instsFull;
++    else
++        ++stats.instsRestricted;
++
++    if (winInsts >= windowInsts)
++        endWindow();
++}
++
++void
++RobResizer::notifyMispredict()
++{
++    ++winMispredicts;
++    ++stats.mispredicts;
++}
++
++void
++RobResizer::endWindow()
++{
++    ++stats.windows;
++
++    if (winBranches < minWindowBranches) {
++        // too few branches to judge accuracy, hold the current state
++        ++stats.quietWindows;
++    } else {
++        double rate = double(winMispredicts) / double(winBranches);
++        stats.windowMispredictRate.sample(rate);
++
++        // a window votes for leaving the current state; any window that
++        // does not vote resets the streak
++        bool vote = (_state == Full) ? rate > shrinkRate : rate < growRate;
++        voteStreak = vote ? voteStreak + 1 : 0;
++
++        DPRINTF(RobResizer, "window: %llu branches, %llu mispredicts, "
++                "rate %.4f, state %s, streak %u\n",
++                winBranches, winMispredicts, rate,
++                _state == Full ? "full" : "restricted", voteStreak);
++
++        if (_state == Full && voteStreak >= shrinkWindows)
++            transition(Restricted);
++        else if (_state == Restricted && voteStreak >= growWindows)
++            transition(Full);
++    }
++
++    winInsts = 0;
++    winBranches = 0;
++    winMispredicts = 0;
++}
++
++void
++RobResizer::transition(State next_state)
++{
++    assert(cpu);
++    _state = next_state;
++    voteStreak = 0;
++
++    unsigned limit;
++    if (next_state == Restricted) {
++        ++stats.shrinks;
++        limit = restrictedEntries;
++    } else {
++        ++stats.grows;
++        limit = fullEntries;
++    }
++
++    DPRINTF(RobResizer, "rob limit -> %u\n", limit);
++    cpu->setWindowLimit(limit);
++}
++
++RobResizer::RobResizerStats::RobResizerStats(statistics::Group *parent)
++    : statistics::Group(parent),
++      ADD_STAT(windows, statistics::units::Count::get(),
++               "Sampling windows completed"),
++      ADD_STAT(quietWindows, statistics::units::Count::get(),
++               "Windows skipped for having too few branches"),
++      ADD_STAT(shrinks, statistics::units::Count::get(),
++               "Transitions from full to restricted"),
++      ADD_STAT(grows, statistics::units::Count::get(),
++               "Transitions from restricted to full"),
++      ADD_STAT(instsFull, statistics::units::Count::get(),
++               "Instructions committed in the full state"),
++      ADD_STAT(instsRestricted, statistics::units::Count::get(),
++               "Instructions committed in the restricted state"),
++      ADD_STAT(mispredicts, statistics::units::Count::get(),
++               "Branch mispredicts seen by the resizer"),
++      ADD_STAT(branches, statistics::units::Count::get(),
++               "Committed control instructions seen by the resizer"),
++      ADD_STAT(windowMispredictRate, statistics::units::Ratio::get(),
++               "Per-window mispredicts per committed branch"),
++      ADD_STAT(restrictedFraction, statistics::units::Ratio::get(),
++               "Fraction of committed instructions in the restricted state",
++               instsRestricted / (instsFull + instsRestricted))
++{
++    windowMispredictRate.init(0.0, 1.0, 0.05).flags(statistics::pdf);
++}
++
++} // namespace o3
++} // namespace gem5
+diff --git a/src/cpu/o3/rob_resizer.hh b/src/cpu/o3/rob_resizer.hh
+new file mode 100644
+index 0000000000..13998671fd
+--- /dev/null
++++ b/src/cpu/o3/rob_resizer.hh
+@@ -0,0 +1,98 @@
++#ifndef __CPU_O3_ROB_RESIZER_HH__
++#define __CPU_O3_ROB_RESIZER_HH__
++
++#include <cstdint>
++
++#include "base/statistics.hh"
++#include "params/RobResizer.hh"
++#include "sim/sim_object.hh"
++
++namespace gem5
++{
++
++namespace o3
++{
++
++class CPU;
++
++/**
++ * two-state fsm that caps the rob (and, proportionally, the iq and lsq)
++ * when the committed branch mispredict rate is high, and restores full
++ * capacity once prediction is accurate again.
++ *
++ * shrinking only lowers the allocation cap. entries already above the
++ * cap are not squashed; they drain through commit as normal.
++ */
++class RobResizer : public SimObject
++{
++  public:
++    enum State
++    {
++        Full,
++        Restricted
++    };
++
++    RobResizer(const RobResizerParams &params);
++
++    /** called once by the cpu constructor. */
++    void setCPU(CPU *cpu);
++
++    /** called by commit for every committed macro instruction. */
++    void notifyCommit(bool is_control);
++
++    /** called by commit when a branch mispredict squash is handled. */
++    void notifyMispredict();
++
++    State state() const { return _state; }
++
++  private:
++    /** evaluates the finished window and resets its counters. */
++    void endWindow();
++
++    /** moves the fsm to next_state and applies the new cap. */
++    void transition(State next_state);
++
++    CPU *cpu;
++
++    State _state;
++
++    /** physical rob size, read from the cpu. */
++    unsigned fullEntries;
++    const unsigned restrictedEntries;
++
++    const uint64_t windowInsts;
++    const unsigned minWindowBranches;
++    const double shrinkRate;
++    const double growRate;
++    const unsigned shrinkWindows;
++    const unsigned growWindows;
++
++    // counters for the current sampling window
++    uint64_t winInsts;
++    uint64_t winBranches;
++    uint64_t winMispredicts;
++
++    // consecutive windows voting for a state change
++    unsigned voteStreak;
++
++    struct RobResizerStats : public statistics::Group
++    {
++        RobResizerStats(statistics::Group *parent);
++
++        statistics::Scalar windows;
++        statistics::Scalar quietWindows;
++        statistics::Scalar shrinks;
++        statistics::Scalar grows;
++        statistics::Scalar instsFull;
++        statistics::Scalar instsRestricted;
++        statistics::Scalar mispredicts;
++        statistics::Scalar branches;
++        statistics::Distribution windowMispredictRate;
++        statistics::Formula restrictedFraction;
++    } stats;
++};
++
++} // namespace o3
++} // namespace gem5
++
++#endif // __CPU_O3_ROB_RESIZER_HH__
