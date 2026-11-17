@@ -1,0 +1,9 @@
+# gem5 output
+results/
+m5out*/
+
+# compiled workloads
+workloads/bin/
+
+__pycache__/
+*.pyc

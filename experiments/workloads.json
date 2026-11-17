@@ -1,0 +1,5 @@
+{
+  "_note": "benchmark programs per workload type. not chosen yet. each entry: {\"name\": \"...\", \"binary\": \"workloads/bin/<file>\", \"args\": []}. binary paths are relative to the repo root.",
+  "unpredictable": [],
+  "predictable": []
+}
