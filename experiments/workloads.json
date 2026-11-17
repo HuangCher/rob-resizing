@@ -1,6 +1,12 @@
 {
-  "_note": "owner: jacob. benchmark programs per workload type. each entry: {\"name\": \"...\", \"binary\": \"workloads/bin/<file>\", \"args\": []}. binary paths are relative to the repo root.",
-  "unpredictable": [],
-  "predictable": [],
-  "phased": []
+  "_note": "Fixed seeds, equal 180000 total kernel iterations by default. Phased alternates three predictable and three unpredictable phases.",
+  "predictable": [
+    {"name": "predictable", "binary": "workloads/bin/predictable", "args": ["180000"]}
+  ],
+  "unpredictable": [
+    {"name": "unpredictable", "binary": "workloads/bin/unpredictable", "args": ["180000"]}
+  ],
+  "phased": [
+    {"name": "phased", "binary": "workloads/bin/phased", "args": ["30000", "6"]}
+  ]
 }
