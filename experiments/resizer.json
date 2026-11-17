@@ -1,6 +1,6 @@
 {
-  "_note": "fsm parameters for the dynamic config. all of these are open design decisions; the runner skips dynamic runs until they are set. rates are mispredicts per committed branch.",
-  "window_insts": null,
+  "_note": "owner: cher (initial values), newman (tuning). fsm parameters for the dynamic config. rates are mispredicts per committed branch.",
+  "window_insts": 10000,
   "min_window_branches": 1,
   "shrink_rate": null,
   "grow_rate": null,

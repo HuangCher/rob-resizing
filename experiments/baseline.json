@@ -1,7 +1,6 @@
 {
-  "_note": "baseline machine settings shared by every run. null means not decided yet; the runner refuses to start until it is filled in.",
+  "_note": "owner: newman. baseline machine settings shared by every run.",
   "isa": "riscv",
   "clock": null,
-  "max_insts": 0,
-  "disable_rvv": false
+  "max_insts": 0
 }
