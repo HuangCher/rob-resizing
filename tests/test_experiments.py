@@ -1,6 +1,3 @@
-"""Local unit/smoke tests (no installed gem5/RISC-V compiler required).
-Run: python3 -m unittest discover -s tests -v
-"""
 import importlib.util
 import json
 import tempfile
@@ -40,8 +37,7 @@ class BenchExperimentTests(unittest.TestCase):
             dynamic = [cmd for _, cmd in jobs if cmd[cmd.index("--rob-config") + 1] == "dynamic"]
             self.assertEqual(len(dynamic), 6)
             self.assertTrue(all("--shrink-rate" in cmd for cmd in dynamic))
-            phased = [cmd for _, cmd in jobs if "--binary" in cmd and
-                      cmd[cmd.index("--binary") + 1].endswith("/phased")]
+            phased = [cmd for _, cmd in jobs if "--binary" in cmd and cmd[cmd.index("--binary") + 1].endswith("/phased")]
             self.assertEqual(len(phased), 10)
             self.assertEqual(phased[0].count("--binary-arg"), 2)
 
@@ -52,9 +48,11 @@ class BenchExperimentTests(unittest.TestCase):
                 results=Path(temp), gem5_binary=Path(temp) / "gem5.opt",
                 config=ROOT / "configs" / "run_o3.py",
             )
+            # null out the fsm fields so the check doesn't depend on the checked-in values
+            resizer = dict(runner.load_json("resizer.json"))
+            resizer.update(shrink_rate=None, grow_rate=None)
             with self.assertRaisesRegex(ValueError, "non-null settings"):
-                runner.build_runs(args, runner.load_json("baseline.json"),
-                                  runner.load_json("resizer.json"), runner.load_json("workloads.json"))
+                runner.build_runs(args, runner.load_json("baseline.json"), resizer, runner.load_json("workloads.json"))
 
     def test_multiple_stats_blocks_and_normalized_metrics(self):
         with tempfile.TemporaryDirectory() as temp:

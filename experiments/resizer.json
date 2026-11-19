@@ -2,8 +2,8 @@
   "_note": "owner: cher (initial values), newman (tuning). fsm parameters for the dynamic config. rates are mispredicts per committed branch.",
   "window_insts": 10000,
   "min_window_branches": 1,
-  "shrink_rate": null,
-  "grow_rate": null,
-  "shrink_windows": null,
-  "grow_windows": null
+  "shrink_rate": 0.05,
+  "grow_rate": 0.02,
+  "shrink_windows": 2,
+  "grow_windows": 4
 }
